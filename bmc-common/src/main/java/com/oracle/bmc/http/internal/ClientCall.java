@@ -1081,17 +1081,191 @@ public final class ClientCall<
 
     public RESP callSync() {
         waiterScheduler = WaiterScheduler.SYNC;
-        SyncFutureWaiter futureWaiter = new SyncFutureWaiter();
-        offloadExecutor = futureWaiter;
-        httpRequest = httpRequest.offloadExecutor(offloadExecutor);
-
         try {
-            return futureWaiter.listenForResult(callAsync0(null));
+            return callSyncWithRetrier();
         } catch (BmcException e) {
             throw e;
         } catch (Throwable e) {
             throw BmcException.createClientSide("Unknown error", e, null, buildServiceDetails());
         }
+    }
+
+    private RESP callSyncWithRetrier() {
+        BmcGenericRetrier retrier =
+                Retriers.createPreferredRetrier(
+                        request.getRetryConfiguration(),
+                        retryConfiguration,
+                        operationUsesDefaultRetries);
+        if (!headers.contains(OPC_CLIENT_RETRIES_HEADER.toLowerCase(Locale.ROOT))) {
+            TerminationStrategy terminationStrategy =
+                    retrier.getWaiter().getWaiterConfiguration().getTerminationStrategy();
+            boolean sendOpcClientRetries =
+                    terminationStrategy instanceof MaxAttemptsTerminationStrategy
+                            && ((MaxAttemptsTerminationStrategy) terminationStrategy)
+                                            .getMaxAttempts()
+                                    > 1;
+            appendHeader(OPC_CLIENT_RETRIES_HEADER, sendOpcClientRetries);
+        }
+        // Use the synchronous retrier
+        return retrier.execute(this, ClientCall::callSyncImpl);
+    }
+
+    private RESP callSyncImpl(ClientCall<REQ, RESP, RESP_BUILDER> ignored) {
+        if (!firstAttempt && hasBinaryRequestBody) {
+            Retriers.tryResetStreamForRetry((InputStream) request.getBody$(), true);
+        }
+        firstAttempt = false;
+
+        String requestId = generateRequestId();
+        if (sendRetryToken) {
+            RetryTokenUtils.addRetryToken(httpRequest);
+        }
+
+        HttpRequest transientRequest = httpRequest.copy();
+
+        RequestInterceptor invocationCallback = request.getInvocationCallback();
+        if (invocationCallback != null) {
+            invocationCallback.intercept(transientRequest);
+        }
+
+        List<String> present =
+                transientRequest
+                        .headers()
+                        .getOrDefault(OPC_REQUEST_ID_HEADER, Collections.emptyList());
+        if (present.isEmpty()) {
+            logger.debug("Generated request ID: {} for URI {}", requestId, httpRequest.uri());
+            transientRequest.header(BmcException.OPC_REQUEST_ID_HEADER, requestId);
+        } else {
+            logger.debug("User-set request ID: {}", present.get(0));
+        }
+
+        if (circuitBreaker == null) {
+            try {
+                HttpResponse response = transientRequest.execute().toCompletableFuture().join();
+                return transformResponseSync(response);
+            } catch (Exception e) {
+                throw unwrapSyncException(e);
+            }
+        } else {
+            if (!circuitBreaker.tryAcquirePermission()) {
+                CallNotAllowedException callNotAllowed =
+                        circuitBreaker.createCallNotAllowedException();
+                throw BmcException.createClientSide(
+                        circuitBreaker.circuitBreakerCallNotPermittedErrorMessage(
+                                httpRequest.uri().toString()),
+                        callNotAllowed,
+                        null,
+                        buildServiceDetails());
+            }
+            long start = circuitBreaker.getCurrentTimestamp();
+            try {
+                HttpResponse response = transientRequest.execute().toCompletableFuture().join();
+                try {
+                    RESP result = transformResponseSync(response);
+                    circuitBreaker.onResult(
+                            circuitBreaker.getCurrentTimestamp() - start,
+                            circuitBreaker.getTimestampUnit(),
+                            response);
+                    return result;
+                } catch (Exception t) {
+                    addToHistory(t);
+                    circuitBreaker.onError(
+                            circuitBreaker.getCurrentTimestamp() - start,
+                            circuitBreaker.getTimestampUnit(),
+                            t);
+                    throw t;
+                }
+            } catch (Exception e) {
+                addToHistory(e);
+                circuitBreaker.onError(
+                        circuitBreaker.getCurrentTimestamp() - start,
+                        circuitBreaker.getTimestampUnit(),
+                        e);
+                throw unwrapSyncException(e);
+            }
+        }
+    }
+
+    private RuntimeException unwrapSyncException(Throwable t) {
+        if (t instanceof CompletionException && t.getCause() != null) {
+            t = t.getCause();
+        }
+        if (t instanceof RuntimeException) {
+            return (RuntimeException) t;
+        }
+        return new RuntimeException(t);
+    }
+
+    private RESP transformResponseSync(HttpResponse rawResponse) {
+        CompletionStage<RESP> failure = checkError(rawResponse);
+        if (failure != null) {
+            try {
+                return failure.toCompletableFuture().join();
+            } catch (CompletionException ce) {
+                throw tryUnwrapBmcException(ce);
+            }
+        }
+
+        RESP_BUILDER builder = responseBuilder.get();
+        builder.__httpStatusCode__(rawResponse.status());
+        builder.headers(rawResponse.headers());
+        boolean notModified = rawResponse.status() == 304;
+        builder.isNotModified(notModified);
+        for (Map.Entry<String, BiConsumer<RESP_BUILDER, String>> headerHandler :
+                responseHeaders.entrySet()) {
+            String header = rawResponse.header(headerHandler.getKey());
+            if (header != null) {
+                headerHandler.getValue().accept(builder, header);
+            }
+        }
+        for (Map.Entry<String, BiConsumer<RESP_BUILDER, Map<String, String>>> headerHandler :
+                responseHeadersMulti.entrySet()) {
+            Map<String, String> found = new HashMap<>();
+            for (Map.Entry<String, List<String>> header : rawResponse.headers().entrySet()) {
+                if (header.getKey().toLowerCase(Locale.ROOT).startsWith(headerHandler.getKey())) {
+                    found.put(header.getKey(), header.getValue().get(0));
+                }
+            }
+            if (!found.isEmpty()) {
+                headerHandler.getValue().accept(builder, found);
+            }
+        }
+        if (responseBodyUnwrappedType == null || notModified) {
+            if (!isContentLengthSet(rawResponse)) {
+                rawResponse.close();
+            }
+            return finalizeResponse(builder);
+        }
+
+        Object deserialized;
+        try {
+            if (responseBodyList) {
+                deserialized = rawResponse.listBody(responseBodyUnwrappedType).toCompletableFuture().join();
+            } else {
+                if (responseBodyUnwrappedType == InputStream.class) {
+                    deserialized = rawResponse.streamBody().toCompletableFuture().join();
+                } else if (responseBodyUnwrappedType == String.class) {
+                    deserialized = rawResponse.textBody().toCompletableFuture().join();
+                    if ("application/json".equalsIgnoreCase(rawResponse.header("Content-Type"))) {
+                        String str = (String) deserialized;
+                        if (str.startsWith("\"") && str.endsWith("\"")) {
+                            try {
+                                deserialized = Serializer.getDefault().readValue(str, String.class);
+                            } catch (IOException e) {
+                                logger.error("Unable to extract string response", e);
+                            }
+                        }
+                    }
+                } else {
+                    deserialized = rawResponse.body(responseBodyUnwrappedType).toCompletableFuture().join();
+                }
+            }
+        } catch (Exception e) {
+            throw unwrapSyncException(e);
+        }
+
+        responseBodyHandler.accept(builder, deserialized);
+        return finalizeResponse(builder);
     }
 
     public static String generateRequestId() {

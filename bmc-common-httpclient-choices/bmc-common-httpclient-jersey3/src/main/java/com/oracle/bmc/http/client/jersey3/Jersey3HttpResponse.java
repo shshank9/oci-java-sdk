@@ -144,6 +144,32 @@ class Jersey3HttpResponse implements HttpResponse {
         response.close();
     }
 
+    @Override
+    public InputStream streamBodySync() {
+        bodyConsumed = true;
+        List<Object> contentType = response.getHeaders().remove(HttpHeaders.CONTENT_TYPE);
+        log.debug("Entity type is InputStream, ignoring contentType {} and processing as stream", contentType);
+        return response.readEntity(InputStream.class);
+    }
+
+    @Override
+    public <T> T bodySync(Class<T> type) {
+        bodyConsumed = true;
+        return response.readEntity(type);
+    }
+
+    @Override
+    public <T> List<T> listBodySync(Class<T> type) {
+        bodyConsumed = true;
+        return response.readEntity(new GenericType<List<T>>() {});
+    }
+
+    @Override
+    public String textBodySync() {
+        bodyConsumed = true;
+        return response.readEntity(String.class);
+    }
+
     private static <T> CompletableFuture<T> failedFuture(Throwable failure) {
         CompletableFuture<T> future = new CompletableFuture<>();
         future.completeExceptionally(failure);

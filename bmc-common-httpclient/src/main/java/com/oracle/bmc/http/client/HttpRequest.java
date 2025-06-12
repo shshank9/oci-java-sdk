@@ -65,4 +65,10 @@ public interface HttpRequest {
     void discard();
 
     CompletionStage<HttpResponse> execute();
+
+    /**
+     * Execute this request synchronously.
+     * @return The HTTP response
+     */
+    HttpResponse executeSync();
 }

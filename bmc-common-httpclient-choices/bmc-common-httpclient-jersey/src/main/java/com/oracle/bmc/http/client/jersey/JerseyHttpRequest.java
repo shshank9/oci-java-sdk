@@ -242,4 +242,10 @@ final class JerseyHttpRequest implements HttpRequest {
         }
         return stage.thenApply(JerseyHttpResponse::new);
     }
+
+    @Override
+    public HttpResponse executeSync() {
+        Response response = buildRequest().invoke();
+        return new JerseyHttpResponse(response);
+    }
 }

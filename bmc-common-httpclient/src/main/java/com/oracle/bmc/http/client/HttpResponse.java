@@ -33,6 +33,26 @@ public interface HttpResponse extends Closeable {
     CompletionStage<String> textBody();
 
     /**
+     * Get the response body as an input stream synchronously.
+     */
+    InputStream streamBodySync();
+
+    /**
+     * Get the response body as a typed object synchronously.
+     */
+    <T> T bodySync(Class<T> type);
+
+    /**
+     * Get the response body as a list of typed objects synchronously.
+     */
+    <T> List<T> listBodySync(Class<T> type);
+
+    /**
+     * Get the response body as text synchronously.
+     */
+    String textBodySync();
+
+    /**
      * Close this response. Some operations on the request will not work after this call (notably
      * {@link #body(Class)}). However if the body has already been requested, that body will remain
      * valid even if the stage has not yet completed, or if it is a streaming response ({@link
